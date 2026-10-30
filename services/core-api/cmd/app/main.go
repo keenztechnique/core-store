@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"corestore/api/internal/handler"
+	"corestore/api/internal/metrics" // <-- Импортируем наш пакет метрик
 	"corestore/api/internal/repository"
 	"log"
 	"net/http"
@@ -14,7 +15,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/redis/go-redis/v9" // <-- Импортируем Redis
+	"github.com/prometheus/client_golang/prometheus/promhttp" // <-- Официальный хендлер Prometheus
+	"github.com/redis/go-redis/v9"                            // <-- Импортируем Redis
 )
 
 func main() {
@@ -45,15 +47,16 @@ func main() {
 
 	// 2. Подключение к Redis
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     redisAddr,
-		Password: "", // нет пароля по умолчанию в нашей докер-инфраструктуре
-		DB:       0,  // дефолтная база
+		Addr: redisAddr,
 	})
 
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		log.Fatalf("❌ Redis не отвечает: %v", err)
 	}
 	log.Println("✅ Успешное подключение к Redis!")
+
+	// 3. Инициализация метрик
+	appMetrics := metrics.NewMetrics("core_api")
 
 	// Инициализация репозиториев и хендлеров
 	productRepo := repository.NewProductRepository(dbPool)
@@ -62,7 +65,6 @@ func main() {
 		log.Fatalf("❌ Не удалось инициализировать таблицу products: %v", err)
 	}
 
-	// Передаем и базу, и Redis в хендлер
 	productHandler := handler.NewProductHandler(productRepo, rdb)
 
 	// Роутер Chi
@@ -70,11 +72,17 @@ func main() {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
+	// Подключаем мидлвар сбора метрик для всех эндпоинтов
+	r.Use(metrics.PrometheusMiddleware(appMetrics))
+
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status": "ok", "service": "core-api"}`))
 	})
+
+	// Эндпоинт, который Prometheus будет опрашивать для сбора метрик
+	r.Handle("/metrics", promhttp.Handler())
 
 	r.Route("/products", func(r chi.Router) {
 		r.Post("/", productHandler.CreateProduct)
