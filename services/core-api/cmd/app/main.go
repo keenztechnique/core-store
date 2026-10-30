@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"corestore/api/internal/handler"
+	"corestore/api/internal/repository"
 	"log"
 	"net/http"
 	"os"
@@ -11,55 +13,64 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() {
-	// 1. Читаем строку подключения к БД (или используем дефолтную для нашей песочницы из docker-compose)
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		databaseURL = "postgres://postgres:secretpassword@localhost:5432/corestore?sslmode=disable"
 	}
 
-	// 2. Инициализируем контекст с таймаутом для подключения к БД
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Подключаемся к PostgreSQL через pgx
-	conn, err := pgx.Connect(ctx, databaseURL)
+	// Инициализация пула соединений с БД (pgxpool)
+	dbPool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
-		log.Fatalf("❌ Не удалось подключиться к базе данных: %v", err)
+		log.Fatalf("❌ Не удалось создать пул соединений с БД: %v", err)
 	}
-	defer conn.Close(context.Background())
+	defer dbPool.Close()
 
-	// Проверяем пинг базы данных
-	if err := conn.Ping(ctx); err != nil {
+	if err := dbPool.Ping(ctx); err != nil {
 		log.Fatalf("❌ База данных не отвечает: %v", err)
 	}
-	log.Println("✅ Успешное подключение к PostgreSQL!")
+	log.Println("✅ Успешное подключение к PostgreSQL (пул активен)!")
 
-	// 3. Настраиваем роутер Chi
+	// Инициализация репозиториев и хендлеров
+	productRepo := repository.NewProductRepository(dbPool)
+
+	// Автоматическое создание таблицы при старте
+	if err := productRepo.InitTable(ctx); err != nil {
+		log.Fatalf("❌ Не удалось инициализировать таблицу products: %v", err)
+	}
+	log.Println("✅ Таблица products проверена/создана успешно.")
+
+	productHandler := handler.NewProductHandler(productRepo)
+
+	// Роутер Chi
 	r := chi.NewRouter()
-
-	// Подключаем базовые мидлвары (логирование, паника-рекавери)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
-	// Эндпоинт для проверки здоровья сервиса (Health Check)
+	// Эндпоинты
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status": "ok", "service": "core-api"}`))
 	})
 
-	// 4. Запускаем HTTP-сервер с поддержкой graceful shutdown (мягкой остановки)
+	r.Route("/products", func(r chi.Router) {
+		r.Post("/", productHandler.CreateProduct)
+		r.Get("/", productHandler.GetProducts)
+	})
+
 	port := ":8080"
 	server := &http.Server{
 		Addr:    port,
 		Handler: r,
 	}
 
-	// Запуск в горутине, чтобы сервер не блокировал основной поток
 	go func() {
 		log.Printf("🚀 Сервер запущен на порту %s", port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -67,7 +78,6 @@ func main() {
 		}
 	}()
 
-	// Ожидание сигнала остановки (Ctrl+C)
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	<-quit
