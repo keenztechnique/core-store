@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"corestore/api/internal/broker" // <-- Импортируем пакет брокера
 	"corestore/api/internal/handler"
 	"corestore/api/internal/metrics" // <-- Импортируем наш пакет метрик
 	"corestore/api/internal/repository"
@@ -30,6 +31,11 @@ func main() {
 		redisAddr = "localhost:6379"
 	}
 
+	kafkaAddr := os.Getenv("KAFKA_BROKER")
+	if kafkaAddr == "" {
+		kafkaAddr = "localhost:9092" // Адрес брокера по умолчанию в Docker Compose
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -55,7 +61,12 @@ func main() {
 	}
 	log.Println("✅ Успешное подключение к Redis!")
 
-	// 3. Инициализация метрик
+	// 3. Инициализация Kafka Producer
+	kafkaProducer := broker.NewKafkaProducer(kafkaAddr, "product-events")
+	defer kafkaProducer.Close()
+	log.Println("✅ Kafka Producer инициализирован!")
+
+	// 4. Инициализация метрик
 	appMetrics := metrics.NewMetrics("core_api")
 
 	// Инициализация репозиториев и хендлеров
@@ -65,14 +76,12 @@ func main() {
 		log.Fatalf("❌ Не удалось инициализировать таблицу products: %v", err)
 	}
 
-	productHandler := handler.NewProductHandler(productRepo, rdb)
+	productHandler := handler.NewProductHandler(productRepo, rdb, kafkaProducer)
 
 	// Роутер Chi
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
-
-	// Подключаем мидлвар сбора метрик для всех эндпоинтов
 	r.Use(metrics.PrometheusMiddleware(appMetrics))
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -81,7 +90,6 @@ func main() {
 		w.Write([]byte(`{"status": "ok", "service": "core-api"}`))
 	})
 
-	// Эндпоинт, который Prometheus будет опрашивать для сбора метрик
 	r.Handle("/metrics", promhttp.Handler())
 
 	r.Route("/products", func(r chi.Router) {

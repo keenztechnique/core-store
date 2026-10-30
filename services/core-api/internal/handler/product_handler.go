@@ -16,16 +16,23 @@ type ProductRepo interface {
 	GetAll(ctx context.Context) ([]domain.Product, error)
 }
 
+// Интерфейс для Kafka продюсера, чтобы код оставался тестируемым
+type EventProducer interface {
+	PublishProductCreated(ctx context.Context, product interface{}) error
+}
+
 type ProductHandler struct {
 	repo     ProductRepo
 	rdb      *redis.Client
+	kafka    EventProducer
 	validate *validator.Validate
 }
 
-func NewProductHandler(repo ProductRepo, rdb *redis.Client) *ProductHandler {
+func NewProductHandler(repo ProductRepo, rdb *redis.Client, kafka EventProducer) *ProductHandler {
 	return &ProductHandler{
 		repo:     repo,
 		rdb:      rdb,
+		kafka:    kafka,
 		validate: validator.New(),
 	}
 }
@@ -58,8 +65,15 @@ func (h *ProductHandler) CreateProduct(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 🗑️ Инвалидируем кэш списка товаров при создании нового
+	// 🗑️ Инвалидируем кэш в Redis
 	_ = h.rdb.Del(ctx, "products:all")
+
+	// 📨 Публикуем событие в Kafka (в реальных проектах это можно делать горутиной или через Outbox паттерн)
+	go func() {
+		bgCtx, bgCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer bgCancel()
+		_ = h.kafka.PublishProductCreated(bgCtx, product)
+	}()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -72,10 +86,8 @@ func (h *ProductHandler) GetProducts(w http.ResponseWriter, r *http.Request) {
 
 	cacheKey := "products:all"
 
-	// 1. Пробуем получить данные из Redis кэша
 	cachedData, err := h.rdb.Get(ctx, cacheKey).Result()
 	if err == nil {
-		// Кэш найден! Отдаем напрямую из Redis (Cache Hit)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-Cache", "HIT")
 		w.WriteHeader(http.StatusOK)
@@ -83,17 +95,14 @@ func (h *ProductHandler) GetProducts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Если кэша нет (Cache Miss), идем в базу данных
 	products, err := h.repo.GetAll(ctx)
 	if err != nil {
 		http.Error(w, `{"error": "internal server error"}`, http.StatusInternalServerError)
 		return
 	}
 
-	// Сериализуем данные в JSON для сохранения в кэш
 	respData, err := json.Marshal(products)
 	if err == nil {
-		// Сохраняем в Redis на 60 секунд
 		_ = h.rdb.Set(ctx, cacheKey, respData, 60*time.Second)
 	}
 
