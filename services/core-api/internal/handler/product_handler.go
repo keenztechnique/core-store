@@ -7,7 +7,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/go-playground/validator/v10" // <-- Импортируем валидатор
+	"github.com/go-playground/validator/v10"
+	"github.com/redis/go-redis/v9"
 )
 
 type ProductRepo interface {
@@ -16,14 +17,16 @@ type ProductRepo interface {
 }
 
 type ProductHandler struct {
-	repo ProductRepo
-	validate *validator.Validate // <-- Добавляем поле для валидатора
+	repo     ProductRepo
+	rdb      *redis.Client
+	validate *validator.Validate
 }
 
-func NewProductHandler(repo ProductRepo) *ProductHandler {
+func NewProductHandler(repo ProductRepo, rdb *redis.Client) *ProductHandler {
 	return &ProductHandler{
 		repo:     repo,
-		validate: validator.New(), // <-- Инициализируем при создании хендлера
+		rdb:      rdb,
+		validate: validator.New(),
 	}
 }
 
@@ -34,20 +37,18 @@ type CreateProductRequest struct {
 
 func (h *ProductHandler) CreateProduct(w http.ResponseWriter, r *http.Request) {
 	var req CreateProductRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" || req.Price <= 0 {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error": "invalid request body"}`, http.StatusBadRequest)
 		return
 	}
 
-	// 🔍 Выполняем валидацию по нашим тегам
 	if err := h.validate.Struct(req); err != nil {
-		// Возвращаем понятную ошибку клиенту, если валидация не прошла
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "validation failed: " + err.Error()})
 		return
 	}
-	
+
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 
@@ -56,6 +57,9 @@ func (h *ProductHandler) CreateProduct(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error": "internal server error"}`, http.StatusInternalServerError)
 		return
 	}
+
+	// 🗑️ Инвалидируем кэш списка товаров при создании нового
+	_ = h.rdb.Del(ctx, "products:all")
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -66,13 +70,35 @@ func (h *ProductHandler) GetProducts(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 
+	cacheKey := "products:all"
+
+	// 1. Пробуем получить данные из Redis кэша
+	cachedData, err := h.rdb.Get(ctx, cacheKey).Result()
+	if err == nil {
+		// Кэш найден! Отдаем напрямую из Redis (Cache Hit)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Cache", "HIT")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(cachedData))
+		return
+	}
+
+	// 2. Если кэша нет (Cache Miss), идем в базу данных
 	products, err := h.repo.GetAll(ctx)
 	if err != nil {
 		http.Error(w, `{"error": "internal server error"}`, http.StatusInternalServerError)
 		return
 	}
 
+	// Сериализуем данные в JSON для сохранения в кэш
+	respData, err := json.Marshal(products)
+	if err == nil {
+		// Сохраняем в Redis на 60 секунд
+		_ = h.rdb.Set(ctx, cacheKey, respData, 60*time.Second)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Cache", "MISS")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(products)
+	w.Write(respData)
 }

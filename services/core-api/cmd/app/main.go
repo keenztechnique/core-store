@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9" // <-- Импортируем Redis
 )
 
 func main() {
@@ -22,10 +23,15 @@ func main() {
 		databaseURL = "postgres://postgres:secretpassword@localhost:5432/corestore?sslmode=disable"
 	}
 
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Инициализация пула соединений с БД (pgxpool)
+	// 1. Подключение к PostgreSQL
 	dbPool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		log.Fatalf("❌ Не удалось создать пул соединений с БД: %v", err)
@@ -35,25 +41,35 @@ func main() {
 	if err := dbPool.Ping(ctx); err != nil {
 		log.Fatalf("❌ База данных не отвечает: %v", err)
 	}
-	log.Println("✅ Успешное подключение к PostgreSQL (пул активен)!")
+	log.Println("✅ Успешное подключение к PostgreSQL!")
+
+	// 2. Подключение к Redis
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     redisAddr,
+		Password: "", // нет пароля по умолчанию в нашей докер-инфраструктуре
+		DB:       0,  // дефолтная база
+	})
+
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Fatalf("❌ Redis не отвечает: %v", err)
+	}
+	log.Println("✅ Успешное подключение к Redis!")
 
 	// Инициализация репозиториев и хендлеров
 	productRepo := repository.NewProductRepository(dbPool)
 
-	// Автоматическое создание таблицы при старте
 	if err := productRepo.InitTable(ctx); err != nil {
 		log.Fatalf("❌ Не удалось инициализировать таблицу products: %v", err)
 	}
-	log.Println("✅ Таблица products проверена/создана успешно.")
 
-	productHandler := handler.NewProductHandler(productRepo)
+	// Передаем и базу, и Redis в хендлер
+	productHandler := handler.NewProductHandler(productRepo, rdb)
 
 	// Роутер Chi
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
-	// Эндпоинты
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
