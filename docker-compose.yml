@@ -69,6 +69,8 @@ services:
   prometheus:
     image: prom/prometheus:v2.45.0
     container_name: core_prometheus
+    extra_hosts:
+    - "host.docker.internal:host-gateway"
     ports:
       - "9090:9090"
     volumes:
@@ -91,3 +93,15 @@ services:
       - core-net
     depends_on:
       - prometheus
+
+  node-exporter:
+    image: prom/node-exporter:v1.6.0
+    container_name: core_node_exporter
+    restart: unless-stopped
+    ports:
+      - "9100:9100"
+    command:
+      - '--path.rootfs=/host'
+    pid: host
+    networks:
+      - core-net # Исправлено с core-network на core-net

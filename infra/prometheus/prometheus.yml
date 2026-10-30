@@ -6,7 +6,10 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
 
-# Здесь в будущем появятся наши микросервисы на Go/Python
-# - job_name: 'core-gateway'
-#   static_configs:
-#     - targets: ['gateway:8080']
+  - job_name: 'core-api'
+    static_configs:
+      - targets: ['host.docker.internal:8080'] # или порт, на котором крутится ваш бэкенд внутри сети
+
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['core_node_exporter:9100']
